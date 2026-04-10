@@ -1,3 +1,5 @@
 fastapi
 uvicorn
 python-dotenv
+motor
+emergentintegrations==0.1.0
