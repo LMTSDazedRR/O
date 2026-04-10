@@ -1,16 +1,18 @@
 import os
 import logging
 import uuid
+import base64
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, List, Dict, Any
+from typing import Optional, List
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, APIRouter, HTTPException
 from pydantic import BaseModel, Field
 from motor.motor_asyncio import AsyncIOMotorClient
-from openai import AsyncOpenAI
 from starlette.middleware.cors import CORSMiddleware
+from google import genai
+from google.genai import types
 
 
 ROOT_DIR = Path(__file__).parent
@@ -19,28 +21,27 @@ load_dotenv(ROOT_DIR / ".env")
 # Environment
 MONGO_URL = os.environ.get("MONGO_URL", "mongodb://localhost:27017")
 DB_NAME = os.environ.get("DB_NAME", "test_database")
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 
-if not OPENAI_API_KEY:
-    logging.warning("OPENAI_API_KEY is not set. AI routes will fail until it is configured.")
+if not GEMINI_API_KEY:
+    logging.warning("GEMINI_API_KEY is not set. AI routes will fail until it is configured.")
 
 # Database
 client = AsyncIOMotorClient(MONGO_URL)
 db = client[DB_NAME]
 
-# OpenAI client
-openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+# Gemini client
+gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
 # App
 app = FastAPI(title="Mini Tutor API")
 api_router = APIRouter(prefix="/api")
 
 
-# Models
 class ChatMessage(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     session_id: str
-    role: str  # "student" or "tutor"
+    role: str
     content: str
     timestamp: datetime = Field(default_factory=datetime.utcnow)
     image_base64: Optional[str] = None
@@ -50,7 +51,7 @@ class ChatMessage(BaseModel):
 class ChatRequest(BaseModel):
     message: str
     session_id: str
-    grade_level: str  # elementary, middle, high
+    grade_level: str
     image_base64: Optional[str] = None
 
 
@@ -70,20 +71,12 @@ class QuizRequest(BaseModel):
     topic: str
 
 
-class SessionHistory(BaseModel):
-    session_id: str
-    title: str
-    last_updated: datetime
-    grade_level: str
-
-
 def get_tutor_system_prompt(grade_level: str) -> str:
     grade_descriptions = {
         "elementary": "elementary school student (grades K-5)",
         "middle": "middle school student (grades 6-8)",
         "high": "high school student (grades 9-12)",
     }
-
     student_level = grade_descriptions.get(grade_level, "student")
 
     return f"""You are Mini Tutor, a friendly and patient math tutor helping a {student_level}.
@@ -91,49 +84,42 @@ def get_tutor_system_prompt(grade_level: str) -> str:
 Your teaching principles:
 1. Never give direct answers immediately. Guide the student to discover the solution.
 2. Break problems into manageable steps.
-3. Ask guiding questions to help the student think.
+3. Ask guiding questions to help the student think through problems.
 4. Use simple, age-appropriate language.
-5. Encourage effort, not just correctness.
-6. If the student is stuck, offer hints before revealing more.
-7. Explain concepts with real-world examples when useful.
+5. Encourage and praise effort, not just correctness.
+6. If a student is stuck, offer hints before revealing more.
+7. Explain concepts using real-world examples when useful.
 8. Be warm, encouraging, and supportive.
-9. Focus on understanding, not just the answer.
-10. Adapt explanation complexity to the student's responses.
+9. Focus on understanding, not just getting the right answer.
+10. Adapt your explanation complexity based on the student's responses.
 
 Important formatting rules:
 - Never use LaTeX notation.
-- Use plain text symbols like ×, ÷, √, ≤, ≥, ≠.
-- Write fractions as 1/2.
-- Write exponents as 2^3.
-- Keep math readable on a mobile screen.
+- Use plain text symbols: × ÷ ² ³ ≈ ≤ ≥ ≠ √
+- Write fractions as 1/2
+- Write exponents as 2^3
+- Keep all math expressions readable on a mobile screen
 
 When presented with a math problem:
-- Help the student understand what is being asked.
-- Help identify what information they have.
-- Help them think about what strategy or formula to use.
-- Let them try each step with your guidance.
-- Only reveal the answer after they've worked through the process.
+- Help the student understand what the problem is asking
+- Guide them to identify what information they have
+- Help them think about what strategy or formula to use
+- Let them try to solve each step with your guidance
+- Only reveal the answer after they have worked through the process
 
 Keep responses concise but complete. Make learning feel like a conversation, not a lecture."""
 
 
-def _build_input_parts(text: str, image_base64: Optional[str] = None) -> List[Dict[str, Any]]:
-    parts: List[Dict[str, Any]] = [{"type": "input_text", "text": text}]
-
-    if image_base64:
-        mime = "image/png"
-        # Very simple header detection for jpeg
-        if image_base64.startswith("/9j/"):
-            mime = "image/jpeg"
-
-        parts.append(
-            {
-                "type": "input_image",
-                "image_url": f"data:{mime};base64,{image_base64}",
-            }
-        )
-
-    return parts
+def _guess_mime_type(image_base64: str) -> str:
+    if image_base64.startswith("/9j/"):
+        return "image/jpeg"
+    if image_base64.startswith("iVBOR"):
+        return "image/png"
+    if image_base64.startswith("R0lGOD"):
+        return "image/gif"
+    if image_base64.startswith("UklGR"):
+        return "image/webp"
+    return "image/png"
 
 
 async def generate_ai_response(
@@ -143,19 +129,42 @@ async def generate_ai_response(
     image_base64: Optional[str] = None,
 ) -> str:
     try:
-        response = await openai_client.responses.create(
-            model="gpt-5.4",
-            instructions=system_message,
-            input=[
-                {
-                    "role": "user",
-                    "content": _build_input_parts(user_text, image_base64),
-                }
+        content_parts: List[types.Part] = [types.Part(text=user_text)]
+
+        if image_base64:
+            mime_type = _guess_mime_type(image_base64)
+            image_bytes = base64.b64decode(image_base64)
+            content_parts.append(
+                types.Part.from_bytes(
+                    data=image_bytes,
+                    mime_type=mime_type,
+                )
+            )
+
+        response = gemini_client.models.generate_content(
+            model="gemini-3-flash",
+            contents=[
+                types.Content(
+                    role="user",
+                    parts=content_parts,
+                )
             ],
+            config=types.GenerateContentConfig(
+                system_instruction=system_message,
+                temperature=0.7,
+            ),
         )
-        return response.output_text.strip()
+
+        text = getattr(response, "text", None)
+        if not text:
+            raise HTTPException(status_code=500, detail="Gemini returned an empty response.")
+
+        return text.strip()
+
+    except HTTPException:
+        raise
     except Exception as e:
-        logging.error("OpenAI API error: %s", str(e))
+        logging.error("Gemini API error: %s", str(e))
         raise HTTPException(status_code=500, detail=f"AI request failed: {str(e)}")
 
 
@@ -250,7 +259,7 @@ async def get_hint(request: HintRequest):
 
         hint_prompt = f"""{context}
 
-The student is asking for a hint. Provide a small helpful hint that guides them toward the next step without giving away the answer. Make it encouraging and focused on their current thinking."""
+The student is asking for a hint. Provide a small, helpful hint that guides them toward the next step without giving away the answer. Make it encouraging and focused on their current thinking."""
 
         hint_response = await generate_ai_response(
             system_message=get_tutor_system_prompt(request.grade_level),
@@ -424,7 +433,6 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
-logger = logging.getLogger(__name__)
 
 
 @app.on_event("shutdown")
